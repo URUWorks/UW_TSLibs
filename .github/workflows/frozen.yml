@@ -1,0 +1,41 @@
+# OpenSSL 1.1.1w (no longer supported upstream) as a backup, built once:
+# Windows x64 with the same scripts and tests as the current one, published in
+# the release "frozen". The macOS one (universal, from 10.11) is uploaded by
+# hand to the same release: gh release upload frozen tslibs_macos_openssl11.zip
+
+name: Frozen builds
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: NASM
+        run: |
+          choco install nasm -y --no-progress
+          "C:\Program Files\NASM" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Build
+        run: scripts/win-build.ps1 -OpenSSL 1.1.1w -Arch x64 -Out out
+
+      - name: Test
+        run: work-x64\libtest-x64.exe out libssl-1_1-x64.dll libcrypto-1_1-x64.dll libhunspellx64.dll tests github.com 1
+
+      - name: Release
+        shell: bash
+        run: |
+          (cd out && 7z a -tzip ../tslibs_win64_openssl11.zip . > /dev/null)
+          gh release view frozen -R "${{ github.repository }}" > /dev/null 2>&1 || \
+            gh release create frozen -R "${{ github.repository }}" --latest=false --title "Frozen: OpenSSL 1.1.1w (backup)" \
+              --notes "OpenSSL 1.1.1w and Hunspell 1.7.2, a backup in case of a problem with OpenSSL 3. OpenSSL 1.1 has no security updates since September 2023."
+          gh release upload frozen tslibs_win64_openssl11.zip -R "${{ github.repository }}" --clobber

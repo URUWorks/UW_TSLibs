@@ -1,0 +1,194 @@
+# OpenSSL 3.5 (LTS) and Hunspell for Tero Subtitler: Windows x64 and ARM64,
+# macOS universal. Every month it looks for a new OpenSSL 3.5.x; if there is
+# one, it builds and tests everything (a real HTTPS connection and a spell
+# check on each system) and only then publishes the release.
+
+name: Build
+
+on:
+  schedule:
+    - cron: "0 7 3 * *" # day 3 of each month, 07:00 UTC
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish a release (only if the OpenSSL version is new, or with force)"
+        type: boolean
+        default: false
+      force:
+        description: "Publish even if this OpenSSL version already has a release"
+        type: boolean
+        default: false
+      openssl:
+        description: "OpenSSL version (empty = the latest 3.5.x)"
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      publish: ${{ steps.v.outputs.publish }}
+    steps:
+      - name: OpenSSL version
+        id: v
+        run: |
+          V="${{ inputs.openssl }}"
+          if [ -z "$V" ]; then
+            V=$(gh api --paginate repos/openssl/openssl/releases -q '.[] | select(.prerelease | not) | .tag_name' \
+              | grep -E '^openssl-3\.5\.[0-9]+$' | sed 's/^openssl-//' | sort -V | tail -1)
+          fi
+          [ -n "$V" ] || { echo "no OpenSSL version"; exit 1; }
+          echo "version=$V" >> $GITHUB_OUTPUT
+          if gh release view "openssl-$V" -R "${{ github.repository }}" > /dev/null 2>&1; then new=false; else new=true; fi
+          if [ "${{ github.event_name }}" = schedule ]; then publish=$new
+          elif [ "${{ inputs.publish }}" = true ] && { [ $new = true ] || [ "${{ inputs.force }}" = true ]; }; then publish=true
+          else publish=false; fi
+          echo "publish=$publish" >> $GITHUB_OUTPUT
+          echo "OpenSSL $V, new: $new, publish: $publish"
+
+  windows:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            zip: tslibs_win64.zip
+          - arch: arm64
+            zip: tslibs_winarm64.zip
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: NASM
+        if: matrix.arch == 'x64'
+        run: |
+          choco install nasm -y --no-progress
+          "C:\Program Files\NASM" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Build
+        run: scripts/win-build.ps1 -OpenSSL ${{ needs.check.outputs.version }} -Arch ${{ matrix.arch }} -Out out
+
+      - name: Test (x64)
+        if: matrix.arch == 'x64'
+        run: work-x64\libtest-x64.exe out libssl-3-x64.dll libcrypto-3-x64.dll libhunspellx64.dll tests
+
+      - name: Zip
+        run: |
+          Compress-Archive -Path out\* -DestinationPath ${{ matrix.zip }}
+          Copy-Item work-${{ matrix.arch }}\libtest-${{ matrix.arch }}.exe .
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.zip }}
+          path: ${{ matrix.zip }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: libtest-${{ matrix.arch }}
+          path: libtest-${{ matrix.arch }}.exe
+
+  # the ARM64 build on a real Windows ARM
+  test-winarm64:
+    needs: windows
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: tslibs_winarm64.zip
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: libtest-arm64
+
+      - name: Test
+        run: |
+          Expand-Archive tslibs_winarm64.zip -DestinationPath out
+          .\libtest-arm64.exe out libssl-3-arm64.dll libcrypto-3-arm64.dll libhunspellx64.dll tests
+
+  macos:
+    needs: check
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Xcode 15
+        run: |
+          sudo xcode-select -s "$(ls -d /Applications/Xcode_15*.app | sort -V | tail -1)"
+          xcodebuild -version
+
+      - name: Build
+        run: scripts/mac-build.sh ${{ needs.check.outputs.version }} out work
+
+      - name: Test (arm64 and x86_64 under Rosetta)
+        run: |
+          /usr/sbin/softwareupdate --install-rosetta --agree-to-license || true
+          work/libtest out libssl.3.dylib libcrypto.3.dylib libhunspellx64.dylib tests
+          arch -x86_64 work/libtest out libssl.3.dylib libcrypto.3.dylib libhunspellx64.dylib tests
+
+      - name: Zip
+        run: |
+          (cd out && zip -qy ../tslibs_macos.zip *)
+          cp work/libtest libtest-macos
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tslibs_macos.zip
+          path: tslibs_macos.zip
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: libtest-macos
+          path: libtest-macos
+
+  # the same zip on a real Intel Mac
+  test-intel:
+    needs: macos
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: tslibs_macos.zip
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: libtest-macos
+
+      - name: Test
+        run: |
+          mkdir out && unzip -q tslibs_macos.zip -d out
+          chmod +x libtest-macos
+          ./libtest-macos out libssl.3.dylib libcrypto.3.dylib libhunspellx64.dylib tests
+
+  release:
+    needs: [check, windows, test-winarm64, macos, test-intel]
+    if: needs.check.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: tslibs_*
+          merge-multiple: true
+
+      - name: Release
+        run: |
+          V=${{ needs.check.outputs.version }}
+          ls -la tslibs_*.zip
+          [ $(ls tslibs_*.zip | wc -l) = 3 ] || { echo "missing zips"; exit 1; }
+          gh release create "openssl-$V" tslibs_*.zip -R "${{ github.repository }}" --latest \
+            --title "OpenSSL $V + Hunspell 1.7.2" \
+            --notes "OpenSSL $V and Hunspell 1.7.2 for Tero Subtitler: Windows x64 and ARM64 (static CRT), macOS universal (arm64 11.0+, x86_64 10.15+). Tested with a real HTTPS connection and a spell check on each system."
